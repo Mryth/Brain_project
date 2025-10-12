@@ -1,6 +1,6 @@
 # 🧠 Brain Cancer Knowledge Graph
 
-Une application web full-stack pour construire un graphe de connaissances à partir de la littérature scientifique biomédicale. L'application extrait les résumés d'articles de PubMed, utilise un modèle NLP pour identifier des entités pertinentes (gènes, maladies, molécules), et modélise leurs relations dans une base de données graphe Neo4j.
+Une application pour construire un graphe de connaissances à partir de la littérature scientifique biomédicale. L'application extrait les résumés d'articles de PubMed, utilise un modèle NLP pour identifier des entités pertinentes (gènes, maladies, molécules), et modélise leurs relations dans une base de données graphe Neo4j.
 
 ## 📋 Table des matières
 
