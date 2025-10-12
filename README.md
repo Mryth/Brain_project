@@ -65,7 +65,7 @@ sudo usermod -aG docker $USER
 ### 2️⃣ Cloner le Dépôt
 
 ```bash
-git clone https://github.com/VOTRE_NOM_UTILISATEUR/NOM_DU_REPO.git
+git clone https://github.com/Mryth/Brain_project.git
 cd NOM_DU_REPO
 ```
 
