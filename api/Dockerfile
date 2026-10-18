@@ -1,23 +1,18 @@
-# Utiliser une image Python 3.9 slim comme base
-FROM python:3.9-slim
+FROM python:3.11-slim
 
-# Définir le répertoire de travail
-WORKDIR /api
+WORKDIR /app
 
-# Copier le fichier des dépendances
-COPY requirements.txt requirements.txt
+# System deps occasionally needed by tokenizers/torch wheels
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl && rm -rf /var/lib/apt/lists/*
 
-# Installer les dépendances
-# On installe torch sans CUDA pour alléger l'image
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copier le reste de l'application
 COPY . .
 
-# Exposer le port de l'API
+# HF model cache lives in a mounted volume (see docker-compose) so it survives restarts
+ENV HF_HOME=/app/.hf_cache
+
 EXPOSE 8000
-
-# Commande pour lancer l'application avec Uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-

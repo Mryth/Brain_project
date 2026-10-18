@@ -1,167 +1,151 @@
-# 🧠 Brain Cancer Knowledge Graph
+# 🧠 Brain Cancer Graph RAG — v2
 
-Une application pour construire un graphe de connaissances à partir de la littérature scientifique biomédicale. L'application extrait les résumés d'articles de PubMed, utilise un modèle NLP pour identifier des entités pertinentes (gènes, maladies, molécules), et modélise leurs relations dans une base de données graphe Neo4j.
+**v2 of this repository.** It evolves the original Brain_project (**v1**, on the `main`
+branch) from a knowledge-graph *builder* into a full **Graph RAG** system: ask natural-language
+questions about brain-cancer literature and get **LLM answers grounded in the graph**, with
+PMID citations and the retrieved subgraph shown.
 
-## 📋 Table des matières
+v1 turned PubMed abstracts into a Neo4j graph. **v2 adds the retrieval + generation layer**
+that makes that graph *answer questions*.
 
-- [Architecture](#-architecture)
-- [Stack Technique](#-stack-technique)
-- [Installation](#-installation-et-lancement)
-- [Utilisation](#-utilisation)
-- [Structure du Projet](#-structure-du-projet)
-- [Dépannage](#-dépannage)
-- [Auteur](#-auteur)
+## What's new vs v1
 
-## 🏛️ Architecture
+| | v1 (Brain_project) | **v2 (this)** |
+|---|---|---|
+| Graph build (PubMed → NER → Neo4j) | ✅ | ✅ (kept) |
+| Abstract text + **embeddings** stored in the graph | ❌ | ✅ `:Abstract{text, embedding}` |
+| **Vector index** (semantic search) | ❌ (Neo4j 4.4) | ✅ Neo4j 5 native vector index |
+| Entity → source-abstract links | ❌ | ✅ `(:Entity)-[:MENTIONED_IN]->(:Abstract)` |
+| **Hybrid retrieval** | ❌ | ✅ vector **+** graph-expansion **+** Text2Cypher |
+| **LLM answer generation** (grounded, cited) | ❌ | ✅ pluggable local LLM (Ollama) |
+| UI | stats + ingest | **chat** + sources + **subgraph viz** |
 
-L'application est construite sur une architecture microservices conteneurisée avec Docker, assurant une séparation claire des responsabilités et une facilité de déploiement.
+## Architecture
 
-### Composants
+```
+          ┌──────────────┐   /ask        ┌───────────────────────────────┐
+ User ──▶ │  Streamlit    │ ───────────▶ │  FastAPI  (Graph RAG)          │
+          │  chat + graph │ ◀─────────── │  retrieve → generate           │
+          └──────────────┘   answer      └───────┬───────────────┬───────┘
+                                                  │               │
+                                   vector + graph │               │ chat
+                                                  ▼               ▼
+                                          ┌──────────────┐  ┌──────────────┐
+                                          │  Neo4j 5     │  │  Ollama      │
+                                          │  KG + vector │  │  local LLM   │
+                                          └──────────────┘  └──────────────┘
+```
 
-1. **Frontend (Streamlit)**
-   - Interface utilisateur web simple et interactive
-   - Lancement du traitement des données
-   - Visualisation des statistiques du graphe
-   - Communication avec le backend via HTTP
+Four containers (`docker-compose.yml`): **neo4j** (graph + vector index), **ollama** (local
+LLM, GPU), **api** (FastAPI: ingestion + RAG), **streamlit-app** (chat UI).
 
-2. **Backend (API FastAPI)**
-   - Cœur logique de l'application
-   - API REST exposant des endpoints pour :
-     - Extraction des données de PubMed
-     - Orchestration du traitement NLP (NER)
-     - Génération et exécution des requêtes Cypher
+## The Graph RAG flow (on `/ask`)
 
-3. **Base de Données (Neo4j)**
-   - Stockage des entités médicales (nœuds)
-   - Modélisation des relations (arêtes)
-   - Analyse de réseaux complexes
-   - Découverte de connexions cachées
+1. **Vector search** — embed the question with a biomedical sentence model
+   (`S-PubMedBert-MS-MARCO`) and query Neo4j's vector index for the top-k most similar
+   `:Abstract` nodes.
+2. **Graph expansion** — from those abstracts, pull the entities mentioned in them and their
+   typed relations (`ASSOCIATED_WITH`, `TREATS`, `MODULATES`, …) → a subgraph + textual facts.
+3. **Text2Cypher** — the LLM writes a **read-only** Cypher query from the schema for
+   structured/aggregate questions ("which genes associate with glioblastoma?"); it's executed
+   and the rows join the context. (A write-guard rejects any `CREATE/DELETE/SET/…`.)
+4. **Generate** — the LLM composes the answer **only from the retrieved context**, citing each
+   claim with `[PMID:…]`. The UI shows the answer, clickable PubMed sources, and the subgraph.
 
-## 🛠️ Stack Technique
-
-- **Orchestration** : Docker & Docker Compose
-- **Frontend** : Streamlit
-- **Backend** : FastAPI (Python 3.9)
-- **Base de Données** : Neo4j 4.4
-- **NLP / Machine Learning** :
-  - Librairie `transformers` (Hugging Face)
-  - Modèle NER : `Kushtrim/ModernBERT-base-biomedical-ner`
-- **Communication API** : Librairie `requests`
-
-## 🚀 Installation et Lancement
-
-Ce projet est entièrement conteneurisé. Les seules dépendances requises sont `Git`, `Docker` et `Docker Compose`.
-
-### 1️⃣ Prérequis (Linux)
-
-Pour éviter les problèmes de permissions avec Docker, ajoutez votre utilisateur au groupe `docker` :
+## Run it
 
 ```bash
-sudo usermod -aG docker $USER
+cp .env.example .env            # add HF_TOKEN if the NER model is gated
+docker compose up -d --build
+
+# pull a local model into Ollama (once); ~2GB, fits an 8GB GPU
+docker compose exec ollama ollama pull qwen2.5:3b-instruct
+
+# open the UI
+#   Streamlit : http://localhost:8501
+#   API docs  : http://localhost:8000/docs
+#   Neo4j     : http://localhost:7474  (neo4j / password123)
 ```
 
-> **Note** : Vous devrez vous déconnecter et vous reconnecter pour que ce changement soit pris en compte.
+In the UI: **sidebar → "Ingest / update graph"** (e.g. 20 articles) to build the graph, then
+ask questions in the chat.
 
-### 2️⃣ Cloner le Dépôt
+**GPU note:** the `ollama` service requests the GPU (needs
+[nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+on the host). No GPU? Comment out the `deploy.resources` block in `docker-compose.yml` —
+Ollama will run the model on CPU (slower). Embeddings/NER run in the `api` container on CPU by
+default (light enough).
 
-```bash
-git clone https://github.com/Mryth/Brain_project.git
-cd NOM_DU_REPO
-```
+## Configuration (env)
 
-### 3️⃣ Configurer les Variables d'Environnement
+| Var | Default | Purpose |
+|---|---|---|
+| `LLM_MODEL` | `qwen2.5:3b-instruct` | local model name (any you've `ollama pull`ed) |
+| `LLM_BASE_URL` / `LLM_API_KEY` | Ollama | **set these to use OpenAI/Groq instead** — no code change |
+| `EMBED_MODEL` | `pritamdeka/S-PubMedBert-MS-MARCO` | biomedical sentence embedder |
+| `VECTOR_TOP_K` | 5 | abstracts from vector search |
+| `ENABLE_TEXT2CYPHER` | 1 | toggle the Text2Cypher branch |
 
-Créez un fichier `.env` à la racine du projet pour stocker votre token Hugging Face :
+**Pluggable LLM:** the code only speaks the OpenAI chat API (`rag/llm.py`), so switching from
+local Ollama to OpenAI/Groq/vLLM is pure configuration (`LLM_BASE_URL` + `LLM_API_KEY` +
+`LLM_MODEL`).
 
-```bash
-touch .env
-```
+## What was validated
 
-Ajoutez votre token dans ce fichier :
+Against a **real Neo4j 5** container (with synthetic embeddings + a mocked LLM — the only
+parts needing your GPU):
+- ✅ vector index creation + **vector search ranks the right abstract first**
+- ✅ ingestion writes (`:Abstract` + entities + `MENTIONED_IN` + typed relations)
+- ✅ graph-expansion facts with PMIDs + subgraph
+- ✅ Text2Cypher executes generated Cypher and returns rows
+- ✅ full pipeline returns a grounded, `[PMID]`-cited answer with sources + subgraph
+- ✅ write-guard blocks `DELETE/CREATE/…` from Text2Cypher
+- ✅ all Python modules syntax-clean; docker-compose + Dockerfiles written
 
-```env
-HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
-```
+The **real LLM** (Ollama) isn't exercised here (this box's GPU driver wasn't available in the
+build sandbox); it runs on your machine via `docker compose` as above.
 
-> **Important** : Remplacez `hf_xxxxxxxxxxxxxxxxxxxx` par votre propre token d'accès Hugging Face.
+## Interview questions (with answers)
 
-### 4️⃣ Lancer l'Application
+**Q1. What is Graph RAG and why use it over plain (vector) RAG?**
+Plain RAG retrieves text chunks by embedding similarity and feeds them to an LLM. **Graph RAG**
+also uses a **knowledge graph**: it can follow *explicit relations* (gene→disease→drug), answer
+*structured/multi-hop* questions, and give cleaner provenance. Here we do **both** — vector
+search for fuzzy semantic recall **and** graph traversal/Text2Cypher for precise relational
+facts — which covers more question types than either alone.
 
-Construisez et démarrez tous les services avec Docker Compose :
+**Q2. How does the hybrid retrieval combine the two?**
+Vector search finds the most *relevant abstracts*; graph expansion turns those into *entity
+relations*; Text2Cypher answers *structured* asks. All three feed one context block to the
+generator. Vector = recall, graph = precision/structure.
 
-```bash
-docker-compose up --build -d
-```
+**Q3. Why store embeddings inside Neo4j instead of a separate vector DB?**
+It keeps retrieval **unified** — one store for both the vectors and the relations, so after a
+vector hit we traverse to neighbours in the *same* query engine (no cross-store joins). Neo4j
+5's native vector index makes this first-class.
 
-> **Note** : Le premier lancement peut prendre plusieurs minutes pour télécharger le modèle NLP. Les lancements suivants seront beaucoup plus rapides.
+**Q4. How do you stop the LLM from hallucinating or running destructive Cypher?**
+Two guards: (a) the answer prompt says *use only the provided context and cite PMIDs*, so
+claims are grounded and checkable; (b) Text2Cypher is constrained to **read-only** and a regex
+**write-guard** rejects any `CREATE/MERGE/DELETE/SET/DROP/LOAD` before execution.
 
-## 💻 Utilisation
+**Q5. Why a biomedical embedding model instead of a general one?**
+Questions and abstracts are dense biomedical language (gene names, mutations, drugs). A
+PubMed-trained embedder (`S-PubMedBert`) puts *IDH1*, *glioma*, *temozolomide* in sensible
+neighbourhoods, so semantic search retrieves the right papers far better than a generic model.
 
-Une fois les conteneurs démarrés, accédez aux différents services :
+**Q6. Why a small local LLM, and how is it pluggable?**
+Local = free, private, offline (patient-data-friendly). A ~3B instruct model fits an 8GB GPU
+and is enough for Text2Cypher + grounded synthesis. `rag/llm.py` speaks the OpenAI API, so the
+same code runs against Ollama **or** OpenAI/Groq by changing three env vars.
 
-| Service | URL | Identifiants |
-|---------|-----|--------------|
-| **Interface Utilisateur** (Streamlit) | http://localhost:8501 | - |
-| **Navigateur Neo4j** | http://localhost:7474 | User: `neo4j`<br>Password: `password123` |
-| **Documentation API** (FastAPI) | http://localhost:8000/docs | - |
+**Q7. What are the limits / next steps?**
+Relations are heuristic (type-pair co-occurrence in an abstract), so some edges are noisy — a
+relation-extraction model would sharpen them. The NER/relation quality caps answer quality.
+Next: entity resolution (merge `TP53`/`p53`), a reranker over retrieved abstracts, and
+evaluation (a Q&A set scored for answer faithfulness + citation correctness).
 
-### Workflow
-
-1. Accédez à l'interface Streamlit sur http://localhost:8501
-2. Lancez l'extraction des données PubMed
-3. Visualisez les statistiques du graphe généré
-4. Explorez les relations dans Neo4j Browser
-
-### Arrêter l'Application
-
-Pour arrêter tous les conteneurs :
-
-```bash
-docker-compose down
-```
-
-Pour arrêter et supprimer les volumes (réinitialisation complète) :
-
-```bash
-docker-compose down -v
-```
-
-## 📊 Structure du Projet
-
-```
-.
-├── docker-compose.yml
-├── .env
-├── frontend/
-│   ├── Dockerfile
-│   ├── app.py
-│   └── requirements.txt
-├── backend/
-│   ├── Dockerfile
-│   ├── main.py
-│   ├── requirements.txt
-│   └── services/
-└── README.md
-```
-
-## 🐛 Dépannage
-
-### Le modèle NLP ne se télécharge pas
-- Vérifiez que votre token Hugging Face est valide
-- Assurez-vous que le fichier `.env` est bien à la racine du projet
-
-### Problèmes de permissions Docker (Linux)
-- Vérifiez que vous êtes dans le groupe docker : `groups $USER`
-- Redémarrez votre session après avoir ajouté l'utilisateur au groupe
-
-### Neo4j ne démarre pas
-- Vérifiez que les ports 7474 et 7687 ne sont pas déjà utilisés
-- Consultez les logs : `docker-compose logs neo4j`
-
-### L'API FastAPI ne répond pas
-- Vérifiez les logs : `docker-compose logs backend`
-- Assurez-vous que le port 8000 est disponible
-
-## 👤 Auteur
-
-- GitHub: [@Mryth](https://github.com/Mryth)
+**Q8. How would you evaluate a Graph RAG system?**
+Separate **retrieval** (did we fetch the right abstracts/subgraph? recall@k, Cypher
+execution-accuracy) from **generation** (is the answer faithful to the context and are the
+PMID citations correct?). Build a small gold Q&A set and score both; track hallucination rate.

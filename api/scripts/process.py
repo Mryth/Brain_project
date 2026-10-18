@@ -1,34 +1,30 @@
-import os
+"""v2 ingestion: NER -> entities + typed relations (as v1), PLUS
+- an :Abstract node per paper holding {pmid, title, text, embedding}
+- (:Entity)-[:MENTIONED_IN]->(:Abstract) links
+- a Neo4j native VECTOR INDEX on :Abstract(embedding)
+so the graph supports both structured traversal and semantic (vector) retrieval."""
 import re
 import logging
 from transformers import pipeline
 from neo4j import Driver
-from .buffer import SQLiteBuffer
 
-# Configuration du logging
+import config
+from rag.embeddings import embed
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION DU MODÈLE NER ---
-HF_TOKEN = os.getenv("HF_TOKEN")
-ner_pipeline = None # Initialisation à None
+# --- NER model (lazy) ---
+_ner = None
+def _get_ner():
+    global _ner
+    if _ner is None:
+        logger.info(f"Loading NER model {config.NER_MODEL}...")
+        _ner = pipeline("ner", model=config.NER_MODEL,
+                        aggregation_strategy="simple", token=config.HF_TOKEN)
+    return _ner
 
-if not HF_TOKEN:
-    logger.warning("Le token Hugging Face (HF_TOKEN) n'est pas défini. Le chargement du modèle est ignoré.")
-else:
-    try:
-        logger.info("Chargement du modèle NER de Hugging Face...")
-        ner_pipeline = pipeline(
-            "ner",
-            model="Kushtrim/ModernBERT-base-biomedical-ner",
-            aggregation_strategy="simple",
-            token=HF_TOKEN
-        )
-        logger.info("Modèle NER chargé avec succès.")
-    except Exception as e:
-        logger.error(f"Impossible de charger le modèle NER. L'API fonctionnera sans capacité NER. Erreur : {e}")
-
-# --- DÉFINITION DES RELATIONS ---
+# entity-type pair -> relation label (unchanged heuristic from v1)
 RELATIONS_MAP = {
     ("SMALL_MOLECULE", "GENEPROD"): "MODULATES",
     ("SMALL_MOLECULE", "DISEASE"): "TREATS",
@@ -37,85 +33,88 @@ RELATIONS_MAP = {
     ("GENEPROD", "CELL_TYPE"): "EXPRESSED_IN",
     ("CELL_LINE", "DISEASE"): "MODELS",
     ("CELL_TYPE", "DISEASE"): "AFFECTED_IN",
-    ("TISSUE", "DISEASE"): "AFFECTED_BY"
+    ("TISSUE", "DISEASE"): "AFFECTED_BY",
 }
 
-# --- FONCTIONS UTILITAIRES ---
-def _sanitize_label(label: str) -> str:
-    return re.sub(r'[^A-Za-z0-9_]', '_', label)
+def _san(label: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "_", label)
 
-def _generate_cypher_queries(abstract_text: str):
-    if not ner_pipeline:
-        logger.warning("Le pipeline NER n'est pas disponible, aucune requête Cypher ne sera générée.")
-        return []
 
+def ensure_vector_index(driver: Driver):
+    """Create the abstract vector index once (Neo4j 5+)."""
+    with driver.session() as s:
+        s.run(
+            f"""CREATE VECTOR INDEX {config.VECTOR_INDEX_NAME} IF NOT EXISTS
+                FOR (a:Abstract) ON (a.embedding)
+                OPTIONS {{ indexConfig: {{
+                    `vector.dimensions`: {config.EMBED_DIM},
+                    `vector.similarity_function`: 'cosine' }} }}"""
+        )
+    logger.info("Vector index ensured.")
+
+
+def _entities_by_type(text: str):
+    ner = _get_ner()
     try:
-        entities = ner_pipeline(abstract_text)
+        ents = ner(text)
     except Exception as e:
-        logger.error(f"Erreur lors de l'exécution du pipeline NER : {e}")
-        return []
+        logger.error(f"NER error: {e}")
+        return {}
+    out = {}
+    for e in ents:
+        t = _san(e["entity_group"]); w = e["word"].strip()
+        if len(w) < 2:
+            continue
+        out.setdefault(t, set()).add(w)
+    return out
 
-    entities_by_type = {}
-    for ent in entities:
-        ent_type = _sanitize_label(ent["entity_group"])
-        ent_word = ent["word"].strip()
-        if ent_type not in entities_by_type:
-            entities_by_type[ent_type] = set()
-        entities_by_type[ent_type].add(ent_word)
 
-    queries = []
-    
-    for ent_type, words in entities_by_type.items():
-        for word in words:
-            query = f"MERGE (n:{ent_type} {{name: $name}})"
-            queries.append((query, {"name": word}))
-
-    for (src_type, tgt_type), rel_label in RELATIONS_MAP.items():
-        src_type_s = _sanitize_label(src_type)
-        tgt_type_s = _sanitize_label(tgt_type)
-        if src_type_s in entities_by_type and tgt_type_s in entities_by_type:
-            query = (
-                f"MATCH (a:{src_type_s}), (b:{tgt_type_s}) "
-                f"WHERE a.name IN $src_names AND b.name IN $tgt_names "
-                f"MERGE (a)-[:{rel_label}]->(b)"
+def _write_abstract(tx, pmid, title, text, embedding, ebt):
+    # 1. the Abstract node (with embedding for vector search)
+    tx.run(
+        """MERGE (a:Abstract {pmid:$pmid})
+           SET a.title=$title, a.text=$text, a.embedding=$emb""",
+        pmid=pmid, title=title, text=text, emb=embedding,
+    )
+    # 2. entity nodes + MENTIONED_IN links
+    for etype, words in ebt.items():
+        for w in words:
+            tx.run(
+                f"""MERGE (n:{etype} {{name:$name}})
+                    SET n:Entity
+                    WITH n
+                    MATCH (a:Abstract {{pmid:$pmid}})
+                    MERGE (n)-[:MENTIONED_IN]->(a)""",
+                name=w, pmid=pmid,
             )
-            params = {
-                "src_names": list(entities_by_type[src_type_s]),
-                "tgt_names": list(entities_by_type[tgt_type_s])
-            }
-            queries.append((query, params))
-            
-    return queries
-
-def process_buffer_to_neo4j(buffer: SQLiteBuffer, driver: Driver):
-    processed_count = 0
-    total_queries = 0
-    
-    if not ner_pipeline:
-        logger.error("Le pipeline NER n'a pas pu être chargé. Le traitement du buffer est annulé.")
-        return 0, 0
-    
-    while True:
-        batch = buffer.get_unprocessed_batch(batch_size=10)
-        if not batch:
-            break
-
-        for article_id, abstract in batch:
-            logger.info(f"Traitement de l'article {article_id}...")
-            cypher_queries = _generate_cypher_queries(abstract)
-            
-            if cypher_queries:
-                with driver.session() as session:
-                    for query, params in cypher_queries:
-                        try:
-                            session.run(query, params)
-                            total_queries += 1
-                        except Exception as e:
-                            logger.error(f"Erreur Cypher pour l'article {article_id}: {e} | Query: {query}")
-            
-            buffer.mark_as_processed(article_id)
-            processed_count += 1
-            
-    return processed_count, total_queries
+    # 3. typed relations between co-mentioned entities (v1 heuristic)
+    n_rel = 0
+    for (s_t, t_t), rel in RELATIONS_MAP.items():
+        s_t, t_t = _san(s_t), _san(t_t)
+        if s_t in ebt and t_t in ebt:
+            for sw in ebt[s_t]:
+                for tw in ebt[t_t]:
+                    tx.run(
+                        f"""MATCH (s:{s_t} {{name:$s}}), (t:{t_t} {{name:$t}})
+                            MERGE (s)-[r:{rel}]->(t)
+                            SET r.source_pmid = $pmid""",
+                        s=sw, t=tw, pmid=pmid,
+                    )
+                    n_rel += 1
+    return n_rel
 
 
+def process_buffer_to_neo4j(buffer, driver: Driver):
+    """Process all unprocessed abstracts: NER + embedding + graph write."""
+    ensure_vector_index(driver)
+    rows = buffer.get_unprocessed()
+    processed, queries = 0, 0
+    for pmid, title, text in rows:
+        ebt = _entities_by_type(text)
+        emb = embed(text)                      # one vector per abstract
+        with driver.session() as s:
+            queries += s.execute_write(_write_abstract, pmid, title, text, emb, ebt)
+        buffer.mark_processed(pmid)
+        processed += 1
+        logger.info(f"Processed PMID {pmid}: {sum(len(v) for v in ebt.values())} entities")
+    return processed, queries

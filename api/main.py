@@ -1,88 +1,80 @@
-import os
-from fastapi import FastAPI, HTTPException
-from neo4j import GraphDatabase, exceptions
+"""Brain Cancer Graph RAG API (v2).
+Ingestion endpoints (build the graph + embeddings) + RAG endpoints (ask questions)."""
 import logging
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from neo4j import GraphDatabase, exceptions
 
-# Import des modules de script
+import config
 from scripts.buffer import SQLiteBuffer
 from scripts.extract import fetch_abstracts_pubmed
-from scripts.process import process_buffer_to_neo4j
+from scripts.process import process_buffer_to_neo4j, ensure_vector_index
+from rag import pipeline, llm
 
-# Configuration du logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Brain Cancer Knowledge Graph API",
-    description="API pour extraire, traiter et charger des données biomédicales dans un graphe Neo4j.",
-    version="1.0.0"
-)
-
-# Configuration Neo4j depuis les variables d'environnement
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password123")
-
-# Initialisation du buffer SQLite
+app = FastAPI(title="Brain Cancer Graph RAG API", version="2.0.0",
+              description="PubMed -> knowledge graph + embeddings -> hybrid Graph RAG Q&A.")
 buffer = SQLiteBuffer(db_path="buffer.db")
 
-def get_neo4j_driver():
-    """Crée et retourne un driver Neo4j."""
+
+def get_driver():
     try:
-        driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-        driver.verify_connectivity()
-        return driver
+        d = GraphDatabase.driver(config.NEO4J_URI,
+                                 auth=(config.NEO4J_USER, config.NEO4J_PASSWORD))
+        d.verify_connectivity()
+        return d
     except exceptions.ServiceUnavailable:
-        raise HTTPException(status_code=503, detail="Neo4j n'est pas disponible.")
+        raise HTTPException(503, "Neo4j unavailable.")
     except exceptions.AuthError:
-        raise HTTPException(status_code=401, detail="Erreur d'authentification Neo4j.")
+        raise HTTPException(401, "Neo4j auth error.")
 
-@app.post("/update-graph/{n_articles}", summary="Met à jour le graphe")
-async def update_graph(n_articles: int):
-    """
-    Orchestre le processus complet :
-    1. Extrait N articles de PubMed et les stocke dans un buffer.
-    2. Traite les articles du buffer (NER) et charge les résultats dans Neo4j.
-    """
+
+class Question(BaseModel):
+    question: str
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "llm_backend": config.LLM_BASE_URL,
+            "llm_model": config.LLM_MODEL, "llm_reachable": llm.available()}
+
+
+@app.post("/update-graph/{n_articles}", summary="Ingest N PubMed articles -> graph + embeddings")
+def update_graph(n_articles: int):
     if not (1 <= n_articles <= 500):
-        raise HTTPException(status_code=400, detail="Le nombre d'articles doit être entre 1 et 500.")
-
+        raise HTTPException(400, "n_articles must be between 1 and 500.")
+    extracted = fetch_abstracts_pubmed(n_articles, buffer)
+    driver = get_driver()
     try:
-        logger.info(f"Étape 1 : Extraction de {n_articles} articles de PubMed...")
-        extracted_count = fetch_abstracts_pubmed(n_articles, buffer)
-        logger.info(f"{extracted_count} abstracts extraits et stockés.")
-
-        logger.info("Étape 2 : Traitement du buffer et chargement dans Neo4j...")
-        driver = get_neo4j_driver()
-        processed_count, queries_executed = process_buffer_to_neo4j(buffer, driver)
+        processed, queries = process_buffer_to_neo4j(buffer, driver)
+    finally:
         driver.close()
-        logger.info(f"{processed_count} abstracts traités. {queries_executed} requêtes exécutées.")
+    return {"abstracts_extracted": extracted, "abstracts_processed": processed,
+            "cypher_queries_executed": queries}
 
-        return {
-            "message": "Mise à jour du graphe terminée.",
-            "abstracts_extracted": extracted_count,
-            "abstracts_processed": processed_count,
-            "cypher_queries_executed": queries_executed
-        }
-    except Exception as e:
-        logger.error(f"Une erreur est survenue lors de la mise à jour : {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/stats", summary="Statistiques du graphe")
-async def get_stats():
-    """Retourne le nombre total de nœuds et de relations dans le graphe."""
-    driver = get_neo4j_driver()
+@app.get("/stats", summary="Graph statistics")
+def stats():
+    driver = get_driver()
     try:
-        with driver.session() as session:
-            nodes = session.run("MATCH (n) RETURN count(n) as count").single()["count"]
-            rels = session.run("MATCH ()-[r]->() RETURN count(r) as count").single()["count"]
-        return {"nodes": nodes, "relationships": rels}
+        with driver.session() as s:
+            nodes = s.run("MATCH (n) RETURN count(n) AS c").single()["c"]
+            rels = s.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+            abstracts = s.run("MATCH (a:Abstract) RETURN count(a) AS c").single()["c"]
+        return {"nodes": nodes, "relationships": rels, "abstracts": abstracts}
     finally:
         driver.close()
 
-@app.delete("/clear-buffer", summary="Vide le buffer d'abstracts")
-async def clear_buffer_endpoint():
-    """Supprime tous les abstracts de la base de données SQLite buffer."""
-    count = buffer.clear_all()
-    return {"status": "buffer_cleared", "abstracts_deleted": count}
 
+@app.post("/ask", summary="Ask a question (hybrid Graph RAG)")
+def ask(q: Question):
+    if not q.question.strip():
+        raise HTTPException(400, "Empty question.")
+    driver = get_driver()
+    try:
+        ensure_vector_index(driver)          # idempotent; safe on every call
+        return pipeline.answer(driver, q.question.strip())
+    finally:
+        driver.close()

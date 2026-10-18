@@ -1,9 +1,5 @@
+__pycache__/
+*.pyc
 .env
 buffer.db
-buffer.db-journal
-api/.cache/
-huggingface_cache/
-pycache/
-*.pyc
-.vscode/
-.idea/
+.venv*/
