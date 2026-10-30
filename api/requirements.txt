@@ -1,6 +1,13 @@
+# CPU torch keeps the API image small; the GPU-heavy LLM runs in the separate `ollama` service.
+# For GPU embeddings/NER in this container, use a CUDA base image + a cu12x torch instead.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 fastapi
 uvicorn[standard]
+pydantic
+neo4j>=5.15
 requests
-neo4j
-transformers
-sentencepiece
+transformers>=4.44
+sentence-transformers
+openai>=1.0
+numpy
